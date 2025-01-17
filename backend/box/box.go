@@ -43,9 +43,9 @@ import (
 	"github.com/rclone/rclone/lib/jwtutil"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/rest"
 	"github.com/youmark/pkcs8"
-	"golang.org/x/oauth2"
 )
 
 const (
@@ -64,12 +64,10 @@ const (
 // Globals
 var (
 	// Description of how to auth for this app
-	oauthConfig = &oauth2.Config{
-		Scopes: nil,
-		Endpoint: oauth2.Endpoint{
-			AuthURL:  "https://app.box.com/api/oauth2/authorize",
-			TokenURL: "https://app.box.com/api/oauth2/token",
-		},
+	oauthConfig = &oauthutil.Config{
+		Scopes:       nil,
+		AuthURL:      "https://app.box.com/api/oauth2/authorize",
+		TokenURL:     "https://app.box.com/api/oauth2/token",
 		ClientID:     rcloneClientID,
 		ClientSecret: obscure.MustReveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.RedirectURL,
@@ -154,7 +152,7 @@ func init() {
 			Default: "",
 			Help: `Impersonate this user ID when using a service account.
 
-Settng this flag allows rclone, when using a JWT service account, to
+Setting this flag allows rclone, when using a JWT service account, to
 act on behalf of another user by setting the as-user header.
 
 The user ID is the Box identifier for a user. User IDs can found for
@@ -256,8 +254,10 @@ func getQueryParams(boxConfig *api.ConfigJSON) map[string]string {
 }
 
 func getDecryptedPrivateKey(boxConfig *api.ConfigJSON) (key *rsa.PrivateKey, err error) {
-
 	block, rest := pem.Decode([]byte(boxConfig.BoxAppSettings.AppAuth.PrivateKey))
+	if block == nil {
+		return nil, errors.New("box: failed to PEM decode private key")
+	}
 	if len(rest) > 0 {
 		return nil, fmt.Errorf("box: extra data included in private key: %w", err)
 	}
@@ -380,7 +380,7 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 
 // readMetaDataForPath reads the metadata from the path
 func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Item, err error) {
-	// defer fs.Trace(f, "path=%q", path)("info=%+v, err=%v", &info, &err)
+	// defer log.Trace(f, "path=%q", path)("info=%+v, err=%v", &info, &err)
 	leaf, directoryID, err := f.dirCache.FindPath(ctx, path, false)
 	if err != nil {
 		if err == fs.ErrorDirNotFound {
@@ -389,20 +389,30 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.It
 		return nil, err
 	}
 
-	found, err := f.listAll(ctx, directoryID, false, true, true, func(item *api.Item) bool {
-		if strings.EqualFold(item.Name, leaf) {
-			info = item
-			return true
-		}
-		return false
+	// Use preupload to find the ID
+	itemMini, err := f.preUploadCheck(ctx, leaf, directoryID, -1)
+	if err != nil {
+		return nil, err
+	}
+	if itemMini == nil {
+		return nil, fs.ErrorObjectNotFound
+	}
+
+	// Now we have the ID we can look up the object proper
+	opts := rest.Opts{
+		Method:     "GET",
+		Path:       "/files/" + itemMini.ID,
+		Parameters: fieldsValue(),
+	}
+	var item api.Item
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.CallJSON(ctx, &opts, nil, &item)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fs.ErrorObjectNotFound
-	}
-	return info, nil
+	return &item, nil
 }
 
 // errorHandler parses a non 2xx error response into an error
@@ -609,7 +619,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		//fmt.Printf("...Error %v\n", err)
+		// fmt.Printf("...Error %v\n", err)
 		return "", err
 	}
 	// fmt.Printf("...Id %q\n", *info.Id)
@@ -762,7 +772,7 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 //
 // It returns "", nil if the file is good to go
 // It returns "ID", nil if the file must be updated
-func (f *Fs) preUploadCheck(ctx context.Context, leaf, directoryID string, size int64) (ID string, err error) {
+func (f *Fs) preUploadCheck(ctx context.Context, leaf, directoryID string, size int64) (item *api.ItemMini, err error) {
 	check := api.PreUploadCheck{
 		Name: f.opt.Enc.FromStandardName(leaf),
 		Parent: api.Parent{
@@ -787,16 +797,16 @@ func (f *Fs) preUploadCheck(ctx context.Context, leaf, directoryID string, size 
 			var conflict api.PreUploadCheckConflict
 			err = json.Unmarshal(apiErr.ContextInfo, &conflict)
 			if err != nil {
-				return "", fmt.Errorf("pre-upload check: JSON decode failed: %w", err)
+				return nil, fmt.Errorf("pre-upload check: JSON decode failed: %w", err)
 			}
 			if conflict.Conflicts.Type != api.ItemTypeFile {
-				return "", fmt.Errorf("pre-upload check: can't overwrite non file with file: %w", err)
+				return nil, fs.ErrorIsDir
 			}
-			return conflict.Conflicts.ID, nil
+			return &conflict.Conflicts, nil
 		}
-		return "", fmt.Errorf("pre-upload check: %w", err)
+		return nil, fmt.Errorf("pre-upload check: %w", err)
 	}
-	return "", nil
+	return nil, nil
 }
 
 // Put the object
@@ -817,11 +827,11 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 	// Preflight check the upload, which returns the ID if the
 	// object already exists
-	ID, err := f.preUploadCheck(ctx, leaf, directoryID, src.Size())
+	item, err := f.preUploadCheck(ctx, leaf, directoryID, src.Size())
 	if err != nil {
 		return nil, err
 	}
-	if ID == "" {
+	if item == nil {
 		return f.PutUnchecked(ctx, in, src, options...)
 	}
 
@@ -829,7 +839,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	o := &Object{
 		fs:     f,
 		remote: remote,
-		id:     ID,
+		id:     item.ID,
 	}
 	return o, o.Update(ctx, in, src, options...)
 }
@@ -954,6 +964,26 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dstObj, leaf, directoryID, err := f.createObject(ctx, remote, srcObj.modTime, srcObj.size)
 	if err != nil {
 		return nil, err
+	}
+
+	// check if dest already exists
+	item, err := f.preUploadCheck(ctx, leaf, directoryID, src.Size())
+	if err != nil {
+		return nil, err
+	}
+	if item != nil { // dest already exists, need to copy to temp name and then move
+		tempSuffix := "-rclone-copy-" + random.String(8)
+		fs.Debugf(remote, "dst already exists, copying to temp name %v", remote+tempSuffix)
+		tempObj, err := f.Copy(ctx, src, remote+tempSuffix)
+		if err != nil {
+			return nil, err
+		}
+		fs.Debugf(remote+tempSuffix, "moving to real name %v", remote)
+		err = f.deleteObject(ctx, item.ID)
+		if err != nil {
+			return nil, err
+		}
+		return f.Move(ctx, tempObj, remote)
 	}
 
 	// Copy the object
@@ -1197,6 +1227,12 @@ func (f *Fs) CleanUp(ctx context.Context) (err error) {
 	return err
 }
 
+// Shutdown shutdown the fs
+func (f *Fs) Shutdown(ctx context.Context) error {
+	f.tokenRenewer.Shutdown()
+	return nil
+}
+
 // ChangeNotify calls the passed function with a path that has had changes.
 // If the implementation uses polling, it should adhere to the given interval.
 //
@@ -1212,7 +1248,7 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 		}
 
 		// box can send duplicate Event IDs. Use this map to track and filter
-		// the ones we've alread processed.
+		// the ones we've already processed.
 		processedEventIDs := make(map[string]time.Time)
 
 		var ticker *time.Ticker
@@ -1709,6 +1745,7 @@ var (
 	_ fs.DirCacheFlusher = (*Fs)(nil)
 	_ fs.PublicLinker    = (*Fs)(nil)
 	_ fs.CleanUpper      = (*Fs)(nil)
+	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.IDer            = (*Object)(nil)
 )

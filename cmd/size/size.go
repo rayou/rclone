@@ -4,8 +4,8 @@ package size
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/fs"
@@ -25,8 +25,7 @@ func init() {
 var commandDefinition = &cobra.Command{
 	Use:   "size remote:path",
 	Short: `Prints the total size and number of objects in remote:path.`,
-	Long: `
-Counts objects in the path and calculates the total size. Prints the
+	Long: `Counts objects in the path and calculates the total size. Prints the
 result to standard output.
 
 By default the output is in human-readable format, but shows values in
@@ -69,10 +68,16 @@ of the size command.
 			if jsonOutput {
 				return json.NewEncoder(os.Stdout).Encode(results)
 			}
-			fmt.Printf("Total objects: %s (%d)\n", fs.CountSuffix(results.Count), results.Count)
-			fmt.Printf("Total size: %s (%d Byte)\n", fs.SizeSuffix(results.Bytes).ByteUnit(), results.Bytes)
+			count := strconv.FormatInt(results.Count, 10)
+			countSuffix := fs.CountSuffix(results.Count).String()
+			if count == countSuffix {
+				operations.SyncPrintf("Total objects: %s\n", count)
+			} else {
+				operations.SyncPrintf("Total objects: %s (%s)\n", countSuffix, count)
+			}
+			operations.SyncPrintf("Total size: %s (%d Byte)\n", fs.SizeSuffix(results.Bytes).ByteUnit(), results.Bytes)
 			if results.Sizeless > 0 {
-				fmt.Printf("Total objects with unknown size: %s (%d)\n", fs.CountSuffix(results.Sizeless), results.Sizeless)
+				operations.SyncPrintf("Total objects with unknown size: %s (%d)\n", fs.CountSuffix(results.Sizeless), results.Sizeless)
 			}
 			return nil
 		})

@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/lib/diskusage"
 )
@@ -637,7 +639,7 @@ func rcBackend(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := doCommand(context.Background(), command, arg, opt)
+	result, err := doCommand(ctx, command, arg, opt)
 	if err != nil {
 		return nil, fmt.Errorf("command %q failed: %w", command, err)
 
@@ -696,4 +698,256 @@ func rcDu(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 		"info": info,
 	}
 	return out, nil
+}
+
+func init() {
+	rc.Add(rc.Call{
+		Path:         "operations/check",
+		AuthRequired: true,
+		Fn:           rcCheck,
+		Title:        "check the source and destination are the same",
+		Help: `Checks the files in the source and destination match.  It compares
+sizes and hashes and logs a report of files that don't
+match.  It doesn't alter the source or destination.
+
+This takes the following parameters:
+
+- srcFs - a remote name string e.g. "drive:" for the source, "/" for local filesystem
+- dstFs - a remote name string e.g. "drive2:" for the destination, "/" for local filesystem
+- download - check by downloading rather than with hash
+- checkFileHash - treat checkFileFs:checkFileRemote as a SUM file with hashes of given type
+- checkFileFs - treat checkFileFs:checkFileRemote as a SUM file with hashes of given type
+- checkFileRemote - treat checkFileFs:checkFileRemote as a SUM file with hashes of given type
+- oneWay -  check one way only, source files must exist on remote
+- combined - make a combined report of changes (default false)
+- missingOnSrc - report all files missing from the source (default true)
+- missingOnDst - report all files missing from the destination (default true)
+- match - report all matching files (default false)
+- differ - report all non-matching files (default true)
+- error - report all files with errors (hashing or reading) (default true)
+
+If you supply the download flag, it will download the data from
+both remotes and check them against each other on the fly.  This can
+be useful for remotes that don't support hashes or if you really want
+to check all the data.
+
+If you supply the size-only global flag, it will only compare the sizes not
+the hashes as well.  Use this for a quick check.
+
+If you supply the checkFileHash option with a valid hash name, the
+checkFileFs:checkFileRemote must point to a text file in the SUM
+format. This treats the checksum file as the source and dstFs as the
+destination. Note that srcFs is not used and should not be supplied in
+this case.
+
+Returns:
+
+- success - true if no error, false otherwise
+- status - textual summary of check, OK or text string
+- hashType - hash used in check, may be missing
+- combined - array of strings of combined report of changes
+- missingOnSrc - array of strings of all files missing from the source
+- missingOnDst - array of strings of all files missing from the destination
+- match - array of strings of all matching files
+- differ - array of strings of all non-matching files
+- error - array of strings of all files with errors (hashing or reading)
+
+`,
+	})
+}
+
+// Writer which writes into the slice provided
+type stringWriter struct {
+	out *[]string
+}
+
+// Write writes len(p) bytes from p to the underlying data stream. It returns
+// the number of bytes written from p (0 <= n <= len(p)) and any error
+// encountered that caused the write to stop early. Write must return a non-nil
+// error if it returns n < len(p). Write must not modify the slice data,
+// even temporarily.
+//
+// Implementations must not retain p.
+func (s stringWriter) Write(p []byte) (n int, err error) {
+	result := string(p)
+	result = strings.TrimSuffix(result, "\n")
+	*s.out = append(*s.out, result)
+	return len(p), nil
+}
+
+// Check two directories
+func rcCheck(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	srcFs, err := rc.GetFsNamed(ctx, in, "srcFs")
+	if err != nil && !rc.IsErrParamNotFound(err) {
+		return nil, err
+	}
+
+	dstFs, err := rc.GetFsNamed(ctx, in, "dstFs")
+	if err != nil {
+		return nil, err
+	}
+
+	checkFileFs, checkFileRemote, err := rc.GetFsAndRemoteNamed(ctx, in, "checkFileFs", "checkFileRemote")
+	if err != nil && !rc.IsErrParamNotFound(err) {
+		return nil, err
+	}
+
+	checkFileHash, err := in.GetString("checkFileHash")
+	if err != nil && !rc.IsErrParamNotFound(err) {
+		return nil, err
+	}
+
+	checkFileSet := 0
+	if checkFileHash != "" {
+		checkFileSet++
+	}
+	if checkFileFs != nil {
+		checkFileSet++
+	}
+	if checkFileRemote != "" {
+		checkFileSet++
+	}
+	if checkFileSet > 0 && checkFileSet < 3 {
+		return nil, fmt.Errorf("need all of checkFileFs, checkFileRemote, checkFileHash to be set together")
+	}
+
+	var checkFileHashType hash.Type
+	if checkFileHash != "" {
+		if err := checkFileHashType.Set(checkFileHash); err != nil {
+			return nil, err
+		}
+		if srcFs != nil {
+			return nil, rc.NewErrParamInvalid(errors.New("only supply dstFs when using checkFileHash"))
+		}
+	} else if srcFs == nil {
+		return nil, rc.NewErrParamInvalid(errors.New("need srcFs parameter when not using checkFileHash"))
+	}
+
+	oneway, _ := in.GetBool("oneway")
+	download, _ := in.GetBool("download")
+
+	opt := &CheckOpt{
+		Fsrc:   srcFs,
+		Fdst:   dstFs,
+		OneWay: oneway,
+	}
+
+	out = rc.Params{}
+
+	getOutput := func(name string, Default bool) io.Writer {
+		active, err := in.GetBool(name)
+		if err != nil {
+			active = Default
+		}
+		if !active {
+			return nil
+		}
+		result := []string{}
+		out[name] = &result
+		return stringWriter{&result}
+	}
+
+	opt.Combined = getOutput("combined", false)
+	opt.MissingOnSrc = getOutput("missingOnSrc", true)
+	opt.MissingOnDst = getOutput("missingOnDst", true)
+	opt.Match = getOutput("match", false)
+	opt.Differ = getOutput("differ", true)
+	opt.Error = getOutput("error", true)
+
+	if checkFileHash != "" {
+		out["hashType"] = checkFileHashType.String()
+		err = CheckSum(ctx, dstFs, checkFileFs, checkFileRemote, checkFileHashType, opt, download)
+	} else {
+		if download {
+			err = CheckDownload(ctx, opt)
+		} else {
+			out["hashType"] = srcFs.Hashes().Overlap(dstFs.Hashes()).GetOne().String()
+			err = Check(ctx, opt)
+		}
+	}
+	if err != nil {
+		out["status"] = err.Error()
+		out["success"] = false
+	} else {
+		out["status"] = "OK"
+		out["success"] = true
+	}
+	return out, nil
+}
+
+func init() {
+	rc.Add(rc.Call{
+		Path:         "operations/hashsum",
+		AuthRequired: true,
+		Fn:           rcHashsum,
+		Title:        "Produces a hashsum file for all the objects in the path.",
+		Help: `Produces a hash file for all the objects in the path using the hash
+named.  The output is in the same format as the standard
+md5sum/sha1sum tool.
+
+This takes the following parameters:
+
+- fs - a remote name string e.g. "drive:" for the source, "/" for local filesystem
+    - this can point to a file and just that file will be returned in the listing.
+- hashType - type of hash to be used
+- download - check by downloading rather than with hash (boolean)
+- base64 - output the hashes in base64 rather than hex (boolean)
+
+If you supply the download flag, it will download the data from the
+remote and create the hash on the fly. This can be useful for remotes
+that don't support the given hash or if you really want to check all
+the data.
+
+Note that if you wish to supply a checkfile to check hashes against
+the current files then you should use operations/check instead of
+operations/hashsum.
+
+Returns:
+
+- hashsum - array of strings of the hashes
+- hashType - type of hash used
+
+Example:
+
+    $ rclone rc --loopback operations/hashsum fs=bin hashType=MD5 download=true base64=true
+    {
+        "hashType": "md5",
+        "hashsum": [
+            "WTSVLpuiXyJO_kGzJerRLg==  backend-versions.sh",
+            "v1b_OlWCJO9LtNq3EIKkNQ==  bisect-go-rclone.sh",
+            "VHbmHzHh4taXzgag8BAIKQ==  bisect-rclone.sh",
+        ]
+    }
+
+See the [hashsum](/commands/rclone_hashsum/) command for more information on the above.
+`,
+	})
+}
+
+// Hashsum a directory
+func rcHashsum(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	ctx, f, err := rc.GetFsNamedFileOK(ctx, in, "fs")
+	if err != nil {
+		return nil, err
+	}
+
+	download, _ := in.GetBool("download")
+	base64, _ := in.GetBool("base64")
+	hashType, err := in.GetString("hashType")
+	if err != nil {
+		return nil, fmt.Errorf("%s\n%w", hash.HelpString(0), err)
+	}
+	var ht hash.Type
+	err = ht.Set(hashType)
+	if err != nil {
+		return nil, fmt.Errorf("%s\n%w", hash.HelpString(0), err)
+	}
+
+	hashes := []string{}
+	err = HashLister(ctx, ht, base64, download, f, stringWriter{&hashes})
+	out = rc.Params{
+		"hashType": ht.String(),
+		"hashsum":  hashes,
+	}
+	return out, err
 }

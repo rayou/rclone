@@ -1,5 +1,4 @@
 //go:build !plan9 && !solaris && !js
-// +build !plan9,!solaris,!js
 
 // Package oracleobjectstorage provides an interface to the OCI object storage system.
 package oracleobjectstorage
@@ -134,6 +133,14 @@ func (f *Fs) setUploadCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
 	err = checkUploadCutoff(cs)
 	if err == nil {
 		old, f.opt.UploadCutoff = f.opt.UploadCutoff, cs
+	}
+	return
+}
+
+func (f *Fs) setCopyCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
+	err = checkUploadChunkSize(cs)
+	if err == nil {
+		old, f.opt.CopyCutoff = f.opt.CopyCutoff, cs
 	}
 	return
 }

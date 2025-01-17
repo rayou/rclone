@@ -1,5 +1,4 @@
 //go:build !plan9
-// +build !plan9
 
 // Package sftp provides a filesystem interface using github.com/pkg/sftp
 package sftp
@@ -76,8 +75,18 @@ func init() {
 			Help:       "SSH password, leave blank to use ssh-agent.",
 			IsPassword: true,
 		}, {
-			Name:      "key_pem",
-			Help:      "Raw PEM-encoded private key.\n\nIf specified, will override key_file parameter.",
+			Name: "key_pem",
+			Help: `Raw PEM-encoded private key.
+
+Note that this should be on a single line with line endings replaced with '\n', eg
+
+    key_pem = -----BEGIN RSA PRIVATE KEY-----\nMaMbaIXtE\n0gAMbMbaSsd\nMbaass\n-----END RSA PRIVATE KEY-----
+
+This will generate the single line correctly:
+
+    awk '{printf "%s\\n", $0}' < ~/.ssh/id_rsa
+
+If specified, it will override the key_file parameter.`,
 			Sensitive: true,
 		}, {
 			Name: "key_file",
@@ -90,6 +99,11 @@ Only PEM encrypted key files (old OpenSSH format) are supported. Encrypted keys
 in the new OpenSSH format can't be used.`,
 			IsPassword: true,
 			Sensitive:  true,
+		}, {
+			Name: "pubkey",
+			Help: `SSH public certificate for public certificate based authentication.
+Set this if you have a signed certificate you want to use for authentication.
+If specified will override pubkey_file.`,
 		}, {
 			Name: "pubkey_file",
 			Help: `Optional path to public key file.
@@ -334,6 +348,25 @@ cost of using more memory.
 			Default:  64,
 			Advanced: true,
 		}, {
+			Name: "connections",
+			Help: strings.ReplaceAll(`Maximum number of SFTP simultaneous connections, 0 for unlimited.
+
+Note that setting this is very likely to cause deadlocks so it should
+be used with care.
+
+If you are doing a sync or copy then make sure connections is one more
+than the sum of |--transfers| and |--checkers|.
+
+If you use |--check-first| then it just needs to be one more than the
+maximum of |--checkers| and |--transfers|.
+
+So for |connections 3| you'd use |--checkers 2 --transfers 2
+--check-first| or |--checkers 1 --transfers 1|.
+
+`, "|", "`"),
+			Default:  0,
+			Advanced: true,
+		}, {
 			Name:    "set_env",
 			Default: fs.SpaceSepList{},
 			Help: `Environment variables to pass to sftp and commands
@@ -449,6 +482,26 @@ Example:
 	myUser:myPass@localhost:9005
 	`,
 			Advanced: true,
+		}, {
+			Name:    "copy_is_hardlink",
+			Default: false,
+			Help: `Set to enable server side copies using hardlinks.
+
+The SFTP protocol does not define a copy command so normally server
+side copies are not allowed with the sftp backend.
+
+However the SFTP protocol does support hardlinking, and if you enable
+this flag then the sftp backend will support server side copies. These
+will be implemented by doing a hardlink from the source to the
+destination.
+
+Not all sftp servers support this.
+
+Note that hardlinking two files together will use no additional space
+as the source and the destination will be the same file.
+
+This feature may be useful backups made with --copy-dest.`,
+			Advanced: true,
 		}},
 	}
 	fs.Register(fsi)
@@ -463,6 +516,7 @@ type Options struct {
 	KeyPem                  string          `config:"key_pem"`
 	KeyFile                 string          `config:"key_file"`
 	KeyFilePass             string          `config:"key_file_pass"`
+	PubKey                  string          `config:"pubkey"`
 	PubKeyFile              string          `config:"pubkey_file"`
 	KnownHostsFile          string          `config:"known_hosts_file"`
 	KeyUseAgent             bool            `config:"key_use_agent"`
@@ -483,6 +537,7 @@ type Options struct {
 	IdleTimeout             fs.Duration     `config:"idle_timeout"`
 	ChunkSize               fs.SizeSuffix   `config:"chunk_size"`
 	Concurrency             int             `config:"concurrency"`
+	Connections             int             `config:"connections"`
 	SetEnv                  fs.SpaceSepList `config:"set_env"`
 	Ciphers                 fs.SpaceSepList `config:"ciphers"`
 	KeyExchange             fs.SpaceSepList `config:"key_exchange"`
@@ -490,6 +545,7 @@ type Options struct {
 	HostKeyAlgorithms       fs.SpaceSepList `config:"host_key_algorithms"`
 	SSH                     fs.SpaceSepList `config:"ssh"`
 	SocksProxy              string          `config:"socks_proxy"`
+	CopyIsHardlink          bool            `config:"copy_is_hardlink"`
 }
 
 // Fs stores the interface to the remote SFTP files
@@ -513,6 +569,7 @@ type Fs struct {
 	pacer        *fs.Pacer   // pacer for operations
 	savedpswd    string
 	sessions     atomic.Int32 // count in use sessions
+	tokens       *pacer.TokenDispenser
 }
 
 // Object is a remote SFTP file that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -520,7 +577,7 @@ type Object struct {
 	fs      *Fs
 	remote  string
 	size    int64       // size of the object
-	modTime time.Time   // modification time of the object
+	modTime uint32      // modification time of the object as unix time
 	mode    os.FileMode // mode bits from the file
 	md5sum  *string     // Cached MD5 checksum
 	sha1sum *string     // Cached SHA1 checksum
@@ -675,6 +732,9 @@ func (f *Fs) newSftpClient(client sshClient, opts ...sftp.ClientOption) (*sftp.C
 // Get an SFTP connection from the pool, or open a new one
 func (f *Fs) getSftpConnection(ctx context.Context) (c *conn, err error) {
 	accounting.LimitTPS(ctx)
+	if f.opt.Connections > 0 {
+		f.tokens.Get()
+	}
 	f.poolMu.Lock()
 	for len(f.pool) > 0 {
 		c = f.pool[0]
@@ -697,6 +757,9 @@ func (f *Fs) getSftpConnection(ctx context.Context) (c *conn, err error) {
 		}
 		return false, nil
 	})
+	if f.opt.Connections > 0 && c == nil {
+		f.tokens.Put()
+	}
 	return c, err
 }
 
@@ -707,6 +770,9 @@ func (f *Fs) getSftpConnection(ctx context.Context) (c *conn, err error) {
 // if err is not nil then it checks the connection is alive using a
 // Getwd request
 func (f *Fs) putSftpConnection(pc **conn, err error) {
+	if f.opt.Connections > 0 {
+		defer f.tokens.Put()
+	}
 	c := *pc
 	if !c.sshClient.CanReuse() {
 		return
@@ -765,13 +831,13 @@ func (f *Fs) drainPool(ctx context.Context) (err error) {
 		if cErr := c.closed(); cErr == nil {
 			cErr = c.close()
 			if cErr != nil {
-				err = cErr
+				fs.Debugf(f, "Ignoring error closing connection: %v", cErr)
 			}
 		}
 		f.pool[i] = nil
 	}
 	f.pool = nil
-	return err
+	return nil
 }
 
 // NewFs creates a new Fs object from the name and root. It connects to
@@ -792,6 +858,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if len(opt.SSH) != 0 && ((opt.User != currentUser && opt.User != "") || opt.Host != "" || (opt.Port != "22" && opt.Port != "")) {
 		fs.Logf(name, "--sftp-ssh is in use - ignoring user/host/port from config - set in the parameters to --sftp-ssh (remove them from the config to silence this warning)")
 	}
+	f.tokens = pacer.NewTokenDispenser(opt.Connections)
 
 	if opt.User == "" {
 		opt.User = currentUser
@@ -936,13 +1003,21 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 
 		// If a public key has been specified then use that
-		if pubkeyFile != "" {
-			certfile, err := os.ReadFile(pubkeyFile)
-			if err != nil {
-				return nil, fmt.Errorf("unable to read cert file: %w", err)
+		if pubkeyFile != "" || opt.PubKey != "" {
+			pubKeyRaw := []byte(opt.PubKey)
+			// Use this error if public key is provided inline and is not a certificate
+			// if public key file is provided instead, use the err in the if block
+			notACertError := errors.New("public key provided is not a certificate: " + opt.PubKey)
+			if opt.PubKey == "" {
+				notACertError = errors.New("public key file is not a certificate file: " + pubkeyFile)
+				err := error(nil)
+				pubKeyRaw, err = os.ReadFile(pubkeyFile)
+				if err != nil {
+					return nil, fmt.Errorf("unable to read cert file: %w", err)
+				}
 			}
 
-			pk, _, _, _, err := ssh.ParseAuthorizedKey(certfile)
+			pk, _, _, _, err := ssh.ParseAuthorizedKey(pubKeyRaw)
 			if err != nil {
 				return nil, fmt.Errorf("unable to parse cert file: %w", err)
 			}
@@ -956,7 +1031,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			// knows everything it needs.
 			cert, ok := pk.(*ssh.Certificate)
 			if !ok {
-				return nil, errors.New("public key file is not a certificate file: " + pubkeyFile)
+				return nil, notACertError
 			}
 			pubsigner, err := ssh.NewCertSigner(cert, signer)
 			if err != nil {
@@ -1014,7 +1089,7 @@ func (f *Fs) keyboardInteractiveReponse(user, instruction string, questions []st
 // save it so on reconnection we give back the previous string.
 // This removes the ability to let the user correct a mistaken entry,
 // but means that reconnects are transparent.
-// We'll re-use config.Pass for this, 'cos we know it's not been
+// We'll reuse config.Pass for this, 'cos we know it's not been
 // specified.
 func (f *Fs) getPass() (string, error) {
 	for f.savedpswd == "" {
@@ -1045,10 +1120,15 @@ func NewFsWithConnection(ctx context.Context, f *Fs, name string, root string, m
 	}
 
 	f.features = (&fs.Features{
-		CanHaveEmptyDirectories: true,
-		SlowHash:                true,
-		PartialUploads:          true,
+		CanHaveEmptyDirectories:  true,
+		SlowHash:                 true,
+		PartialUploads:           true,
+		DirModTimeUpdatesOnWrite: true, // indicate writing files to a directory updates its modtime
 	}).Fill(ctx, f)
+	if !opt.CopyIsHardlink {
+		// Disable server side copy unless --sftp-copy-is-hardlink is set
+		f.features.Copy = nil
+	}
 	// Make a connection and pool it to return errors early
 	c, err := f.getSftpConnection(ctx)
 	if err != nil {
@@ -1342,6 +1422,15 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	return f.mkdir(ctx, root)
 }
 
+// DirSetModTime sets the directory modtime for dir
+func (f *Fs) DirSetModTime(ctx context.Context, dir string, modTime time.Time) error {
+	o := Object{
+		fs:     f,
+		remote: dir,
+	}
+	return o.SetModTime(ctx, modTime)
+}
+
 // Rmdir removes the root directory of the Fs object
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	// Check to see if directory is empty as some servers will
@@ -1397,6 +1486,43 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dstObj, err := f.NewObject(ctx, remote)
 	if err != nil {
 		return nil, fmt.Errorf("Move NewObject failed: %w", err)
+	}
+	return dstObj, nil
+}
+
+// Copy server side copies a remote sftp file object using hardlinks
+func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	if !f.opt.CopyIsHardlink {
+		return nil, fs.ErrorCantCopy
+	}
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't copy - not same remote type")
+		return nil, fs.ErrorCantCopy
+	}
+	err := f.mkParentDir(ctx, remote)
+	if err != nil {
+		return nil, fmt.Errorf("Copy mkParentDir failed: %w", err)
+	}
+	c, err := f.getSftpConnection(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("Copy: %w", err)
+	}
+	srcPath, dstPath := srcObj.path(), path.Join(f.absRoot, remote)
+	err = c.sftpClient.Link(srcPath, dstPath)
+	f.putSftpConnection(&c, err)
+	if err != nil {
+		if sftpErr, ok := err.(*sftp.StatusError); ok {
+			if sftpErr.FxCode() == sftp.ErrSSHFxOpUnsupported {
+				// Remote doesn't support Link
+				return nil, fs.ErrorCantCopy
+			}
+		}
+		return nil, fmt.Errorf("Copy failed: %w", err)
+	}
+	dstObj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return nil, fmt.Errorf("Copy NewObject failed: %w", err)
 	}
 	return dstObj, nil
 }
@@ -1602,7 +1728,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 		fs.Debugf(f, "About path %q", aboutPath)
 		vfsStats, err = c.sftpClient.StatVFS(aboutPath)
 	}
-	f.putSftpConnection(&c, err) // Return to pool asap, if running shell command below it will be re-used
+	f.putSftpConnection(&c, err) // Return to pool asap, if running shell command below it will be reused
 	if vfsStats != nil {
 		total := vfsStats.TotalSpace()
 		free := vfsStats.FreeSpace()
@@ -1855,7 +1981,7 @@ func (o *Object) Size() int64 {
 
 // ModTime returns the modification time of the remote sftp file
 func (o *Object) ModTime(ctx context.Context) time.Time {
-	return o.modTime
+	return time.Unix(int64(o.modTime), 0)
 }
 
 // path returns the native SFTP path of the object
@@ -1870,7 +1996,7 @@ func (o *Object) shellPath() string {
 
 // setMetadata updates the info in the object from the stat result passed in
 func (o *Object) setMetadata(info os.FileInfo) {
-	o.modTime = info.ModTime()
+	o.modTime = info.Sys().(*sftp.FileStat).Mtime
 	o.size = info.Size()
 	o.mode = info.Mode()
 }
@@ -1923,7 +2049,7 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 		return fmt.Errorf("SetModTime failed: %w", err)
 	}
 	err = o.stat(ctx)
-	if err != nil {
+	if err != nil && err != fs.ErrorIsDir {
 		return fmt.Errorf("SetModTime stat failed: %w", err)
 	}
 	return nil
@@ -1975,10 +2101,10 @@ func (file *objectReader) Read(p []byte) (n int, err error) {
 
 // Close a reader of a remote sftp file
 func (file *objectReader) Close() (err error) {
-	// Close the sftpFile - this will likely cause the WriteTo to error
-	err = file.sftpFile.Close()
 	// Close the pipeReader so writes to the pipeWriter fail
 	_ = file.pipeReader.Close()
+	// Close the sftpFile - this will likely cause the WriteTo to error
+	err = file.sftpFile.Close()
 	// Wait for the background process to finish
 	<-file.done
 	// Show connection no longer in use
@@ -2044,7 +2170,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		return fmt.Errorf("Update: %w", err)
 	}
-	// Hang on to the connection for the whole upload so it doesn't get re-used while we are uploading
+	// Hang on to the connection for the whole upload so it doesn't get reused while we are uploading
 	file, err := c.sftpClient.OpenFile(o.path(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		o.fs.putSftpConnection(&c, err)
@@ -2093,7 +2219,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			// In the specific case of o.fs.opt.SetModTime == false
 			// if the object wasn't found then don't return an error
 			fs.Debugf(o, "Not found after upload with set_modtime=false so returning best guess")
-			o.modTime = src.ModTime(ctx)
+			o.modTime = uint32(src.ModTime(ctx).Unix())
 			o.size = src.Size()
 			o.mode = os.FileMode(0666) // regular file
 		} else if err != nil {
@@ -2117,11 +2243,13 @@ func (o *Object) Remove(ctx context.Context) error {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs          = &Fs{}
-	_ fs.PutStreamer = &Fs{}
-	_ fs.Mover       = &Fs{}
-	_ fs.DirMover    = &Fs{}
-	_ fs.Abouter     = &Fs{}
-	_ fs.Shutdowner  = &Fs{}
-	_ fs.Object      = &Object{}
+	_ fs.Fs             = &Fs{}
+	_ fs.PutStreamer    = &Fs{}
+	_ fs.Mover          = &Fs{}
+	_ fs.Copier         = &Fs{}
+	_ fs.DirMover       = &Fs{}
+	_ fs.DirSetModTimer = &Fs{}
+	_ fs.Abouter        = &Fs{}
+	_ fs.Shutdowner     = &Fs{}
+	_ fs.Object         = &Object{}
 )

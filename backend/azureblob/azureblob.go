@@ -1,5 +1,4 @@
 //go:build !plan9 && !solaris && !js
-// +build !plan9,!solaris,!js
 
 // Package azureblob provides an interface to the Microsoft Azure blob object storage system
 package azureblob
@@ -8,6 +7,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -210,6 +210,22 @@ keys instead of setting ` + "`service_principal_file`" + `.
 `,
 			Advanced: true,
 		}, {
+			Name: "disable_instance_discovery",
+			Help: `Skip requesting Microsoft Entra instance metadata
+
+This should be set true only by applications authenticating in
+disconnected clouds, or private clouds such as Azure Stack.
+
+It determines whether rclone requests Microsoft Entra instance
+metadata from ` + "`https://login.microsoft.com/`" + ` before
+authenticating.
+
+Setting this to true will skip this request, making you responsible
+for ensuring the configured authority is valid and trustworthy.
+`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name: "use_msi",
 			Help: `Use a managed service identity to authenticate (only works in Azure).
 
@@ -241,6 +257,20 @@ msi_client_id, or msi_mi_res_id parameters.`,
 		}, {
 			Name:     "use_emulator",
 			Help:     "Uses local storage emulator if provided as 'true'.\n\nLeave blank if using real azure storage endpoint.",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "use_az",
+			Help: `Use Azure CLI tool az for authentication
+
+Set to use the [Azure CLI tool az](https://learn.microsoft.com/en-us/cli/azure/)
+as the sole means of authentication.
+
+Setting this can be useful if you wish to use the az CLI on a host with
+a System Managed Identity that you do not want to use.
+
+Don't set env_auth at the same time.
+`,
 			Default:  false,
 			Advanced: true,
 		}, {
@@ -295,10 +325,10 @@ avoid the time out.`,
 			Advanced: true,
 		}, {
 			Name: "access_tier",
-			Help: `Access tier of blob: hot, cool or archive.
+			Help: `Access tier of blob: hot, cool, cold or archive.
 
-Archived blobs can be restored by setting access tier to hot or
-cool. Leave blank if you intend to use default access tier, which is
+Archived blobs can be restored by setting access tier to hot, cool or
+cold. Leave blank if you intend to use default access tier, which is
 set at account level
 
 If there is no "access tier" specified, rclone doesn't apply any tier.
@@ -306,7 +336,7 @@ rclone performs "Set Tier" operation on blobs while uploading, if objects
 are not modified, specifying "access tier" to new one will have no effect.
 If blobs are in "archive tier" at remote, trying to perform data transfer
 operations from remote will not be allowed. User should first restore by
-tiering blob to "Hot" or "Cool".`,
+tiering blob to "Hot", "Cool" or "Cold".`,
 			Advanced: true,
 		}, {
 			Name:    "archive_tier_delete",
@@ -401,6 +431,24 @@ rclone does if you know the container exists already.
 			Help:     `If set, do not do HEAD before GET when getting objects.`,
 			Default:  false,
 			Advanced: true,
+		}, {
+			Name: "delete_snapshots",
+			Help: `Set to specify how to deal with snapshots on blob deletion.`,
+			Examples: []fs.OptionExample{
+				{
+					Value: "",
+					Help:  "By default, the delete operation fails if a blob has snapshots",
+				}, {
+					Value: string(blob.DeleteSnapshotsOptionTypeInclude),
+					Help:  "Specify 'include' to remove the root blob and all its snapshots",
+				}, {
+					Value: string(blob.DeleteSnapshotsOptionTypeOnly),
+					Help:  "Specify 'only' to remove only the snapshots but keep the root blob.",
+				},
+			},
+			Default:   "",
+			Exclusive: true,
+			Advanced:  true,
 		}},
 	})
 }
@@ -420,10 +468,12 @@ type Options struct {
 	Username                   string               `config:"username"`
 	Password                   string               `config:"password"`
 	ServicePrincipalFile       string               `config:"service_principal_file"`
+	DisableInstanceDiscovery   bool                 `config:"disable_instance_discovery"`
 	UseMSI                     bool                 `config:"use_msi"`
 	MSIObjectID                string               `config:"msi_object_id"`
 	MSIClientID                string               `config:"msi_client_id"`
 	MSIResourceID              string               `config:"msi_mi_res_id"`
+	UseAZ                      bool                 `config:"use_az"`
 	Endpoint                   string               `config:"endpoint"`
 	ChunkSize                  fs.SizeSuffix        `config:"chunk_size"`
 	UploadConcurrency          int                  `config:"upload_concurrency"`
@@ -437,6 +487,7 @@ type Options struct {
 	DirectoryMarkers           bool                 `config:"directory_markers"`
 	NoCheckContainer           bool                 `config:"no_check_container"`
 	NoHeadObject               bool                 `config:"no_head_object"`
+	DeleteSnapshots            string               `config:"delete_snapshots"`
 }
 
 // Fs represents a remote azure server
@@ -468,6 +519,7 @@ type Object struct {
 	mimeType   string            // Content-Type of the object
 	accessTier blob.AccessTier   // Blob Access Tier
 	meta       map[string]string // blob metadata - take metadataMu when accessing
+	tags       map[string]string // blob tags
 }
 
 // ------------------------------------------------------------
@@ -520,6 +572,7 @@ func (o *Object) split() (container, containerPath string) {
 func validateAccessTier(tier string) bool {
 	return strings.EqualFold(tier, string(blob.AccessTierHot)) ||
 		strings.EqualFold(tier, string(blob.AccessTierCool)) ||
+		strings.EqualFold(tier, string(blob.AccessTierCold)) ||
 		strings.EqualFold(tier, string(blob.AccessTierArchive))
 }
 
@@ -649,8 +702,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if opt.AccessTier == "" {
 		opt.AccessTier = string(defaultAccessTier)
 	} else if !validateAccessTier(opt.AccessTier) {
-		return nil, fmt.Errorf("supported access tiers are %s, %s and %s",
-			string(blob.AccessTierHot), string(blob.AccessTierCool), string(blob.AccessTierArchive))
+		return nil, fmt.Errorf("supported access tiers are %s, %s, %s and %s",
+			string(blob.AccessTierHot), string(blob.AccessTierCool), string(blob.AccessTierCold), string(blob.AccessTierArchive))
 	}
 
 	if !validatePublicAccess((opt.PublicAccess)) {
@@ -691,10 +744,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		ClientOptions: policyClientOptions,
 	}
 
-	// Here we auth by setting one of cred, sharedKeyCred or f.svc
+	// Here we auth by setting one of cred, sharedKeyCred, f.svc or anonymous
 	var (
 		cred          azcore.TokenCredential
 		sharedKeyCred *service.SharedKeyCredential
+		anonymous     = false
 	)
 	switch {
 	case opt.EnvAuth:
@@ -704,7 +758,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 		// Read credentials from the environment
 		options := azidentity.DefaultAzureCredentialOptions{
-			ClientOptions: policyClientOptions,
+			ClientOptions:            policyClientOptions,
+			DisableInstanceDiscovery: opt.DisableInstanceDiscovery,
 		}
 		cred, err = azidentity.NewDefaultAzureCredential(&options)
 		if err != nil {
@@ -854,6 +909,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		if err != nil {
 			return nil, fmt.Errorf("failed to acquire MSI token: %w", err)
 		}
+	case opt.UseAZ:
+		var options = azidentity.AzureCLICredentialOptions{}
+		cred, err = azidentity.NewAzureCLICredential(&options)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Azure CLI credentials: %w", err)
+		}
+	case opt.Account != "":
+		// Anonymous access
+		anonymous = true
 	default:
 		return nil, errors.New("no authentication method configured")
 	}
@@ -882,6 +946,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			f.svc, err = service.NewClient(opt.Endpoint, cred, &clientOpt)
 			if err != nil {
 				return nil, fmt.Errorf("create client failed: %w", err)
+			}
+		} else if anonymous {
+			// Anonymous public access
+			f.svc, err = service.NewClientWithNoCredential(opt.Endpoint, &clientOpt)
+			if err != nil {
+				return nil, fmt.Errorf("create public client failed: %w", err)
 			}
 		}
 	}
@@ -1068,7 +1138,7 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 			isDirectory := isDirectoryMarker(*file.Properties.ContentLength, file.Metadata, remote)
 			if isDirectory {
 				// Don't insert the root directory
-				if remote == directory {
+				if remote == f.opt.Enc.ToStandardPath(directory) {
 					continue
 				}
 				// process directory markers as directories
@@ -1807,6 +1877,14 @@ func (o *Object) decodeMetaDataFromBlob(info *container.BlobItem) (err error) {
 	return nil
 }
 
+func (o *Object) getTags() (tags map[string]string) {
+	if o.tags != nil {
+		return o.tags
+	}
+
+	return map[string]string{}
+}
+
 // getBlobSVC creates a blob client
 func (o *Object) getBlobSVC() *blob.Client {
 	container, directory := o.split()
@@ -1899,7 +1977,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	var offset int64
 	var count int64
 	if o.AccessTier() == blob.AccessTierArchive {
-		return nil, fmt.Errorf("blob in archive tier, you need to set tier to hot or cool first")
+		return nil, fmt.Errorf("blob in archive tier, you need to set tier to hot, cool, cold first")
 	}
 	fs.FixRangeOption(options, o.size)
 	for _, option := range options {
@@ -1965,34 +2043,21 @@ func (rs *readSeekCloser) Close() error {
 	return nil
 }
 
-// increment the array as LSB binary
-func increment(xs *[8]byte) {
-	for i, digit := range xs {
-		newDigit := digit + 1
-		xs[i] = newDigit
-		if newDigit >= digit {
-			// exit if no carry
-			break
-		}
-	}
-}
-
 // record chunk number and id for Close
 type azBlock struct {
-	chunkNumber int
+	chunkNumber uint64
 	id          string
 }
 
 // Implements the fs.ChunkWriter interface
 type azChunkWriter struct {
-	chunkSize     int64
-	size          int64
-	f             *Fs
-	ui            uploadInfo
-	blocksMu      sync.Mutex // protects the below
-	blocks        []azBlock  // list of blocks for finalize
-	binaryBlockID [8]byte    // block counter as LSB first 8 bytes
-	o             *Object
+	chunkSize int64
+	size      int64
+	f         *Fs
+	ui        uploadInfo
+	blocksMu  sync.Mutex // protects the below
+	blocks    []azBlock  // list of blocks for finalize
+	o         *Object
 }
 
 // OpenChunkWriter returns the chunk size and a ChunkWriter
@@ -2077,16 +2142,16 @@ func (w *azChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 		return 0, nil
 	}
 	md5sum := m.Sum(nil)
-	transactionalMD5 := md5sum[:]
 
 	// increment the blockID and save the blocks for finalize
-	increment(&w.binaryBlockID)
-	blockID := base64.StdEncoding.EncodeToString(w.binaryBlockID[:])
+	var binaryBlockID [8]byte // block counter as LSB first 8 bytes
+	binary.LittleEndian.PutUint64(binaryBlockID[:], uint64(chunkNumber))
+	blockID := base64.StdEncoding.EncodeToString(binaryBlockID[:])
 
 	// Save the blockID for the commit
 	w.blocksMu.Lock()
 	w.blocks = append(w.blocks, azBlock{
-		chunkNumber: chunkNumber,
+		chunkNumber: uint64(chunkNumber),
 		id:          blockID,
 	})
 	w.blocksMu.Unlock()
@@ -2099,12 +2164,15 @@ func (w *azChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 		}
 		options := blockblob.StageBlockOptions{
 			// Specify the transactional md5 for the body, to be validated by the service.
-			TransactionalValidation: blob.TransferValidationTypeMD5(transactionalMD5),
+			TransactionalValidation: blob.TransferValidationTypeMD5(md5sum),
 		}
 		_, err = w.ui.blb.StageBlock(ctx, blockID, &readSeekCloser{Reader: reader, Seeker: reader}, &options)
 		if err != nil {
 			if chunkNumber <= 8 {
 				return w.f.shouldRetry(ctx, err)
+			}
+			if fserrors.ContextError(ctx, &err) {
+				return false, err
 			}
 			// retry all chunks once have done the first few
 			return true, err
@@ -2119,7 +2187,7 @@ func (w *azChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 	return currentChunkSize, err
 }
 
-// Abort the multpart upload.
+// Abort the multipart upload.
 //
 // FIXME it would be nice to delete uncommitted blocks.
 //
@@ -2151,14 +2219,26 @@ func (w *azChunkWriter) Close(ctx context.Context) (err error) {
 		return w.blocks[i].chunkNumber < w.blocks[j].chunkNumber
 	})
 
-	// Create a list of block IDs
+	// Create and check a list of block IDs
 	blockIDs := make([]string, len(w.blocks))
 	for i := range w.blocks {
+		if w.blocks[i].chunkNumber != uint64(i) {
+			return fmt.Errorf("internal error: expecting chunkNumber %d but got %d", i, w.blocks[i].chunkNumber)
+		}
+		chunkBytes, err := base64.StdEncoding.DecodeString(w.blocks[i].id)
+		if err != nil {
+			return fmt.Errorf("internal error: bad block ID: %w", err)
+		}
+		chunkNumber := binary.LittleEndian.Uint64(chunkBytes)
+		if w.blocks[i].chunkNumber != chunkNumber {
+			return fmt.Errorf("internal error: expecting decoded chunkNumber %d but got %d", w.blocks[i].chunkNumber, chunkNumber)
+		}
 		blockIDs[i] = w.blocks[i].id
 	}
 
 	options := blockblob.CommitBlockListOptions{
 		Metadata:    w.o.getMetadata(),
+		Tags:        w.o.getTags(),
 		Tier:        parseTier(w.f.opt.AccessTier),
 		HTTPHeaders: &w.ui.httpHeaders,
 	}
@@ -2214,6 +2294,7 @@ func (o *Object) uploadSinglepart(ctx context.Context, in io.Reader, size int64,
 
 	options := blockblob.UploadOptions{
 		Metadata:    o.getMetadata(),
+		Tags:        o.getTags(),
 		Tier:        parseTier(o.fs.opt.AccessTier),
 		HTTPHeaders: &ui.httpHeaders,
 	}
@@ -2284,6 +2365,20 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options [
 		switch lowerKey {
 		case "":
 			// ignore
+		case "x-ms-tags":
+			if o.tags == nil {
+				o.tags = make(map[string]string)
+			}
+
+			tags := strings.Split(value, ",")
+			for _, tag := range tags {
+				parts := strings.SplitN(tag, "=", 2)
+				if len(parts) != 2 {
+					return ui, fmt.Errorf("invalid tag %q", tag)
+				}
+
+				o.tags[parts[0]] = parts[1]
+			}
 		case "cache-control":
 			ui.httpHeaders.BlobCacheControl = pString(value)
 		case "content-disposition":
@@ -2355,9 +2450,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 // Remove an object
 func (o *Object) Remove(ctx context.Context) error {
 	blb := o.getBlobSVC()
-	//only := blob.DeleteSnapshotsOptionTypeOnly
-	opt := blob.DeleteOptions{
-		//DeleteSnapshots: &only,
+	opt := blob.DeleteOptions{}
+	if o.fs.opt.DeleteSnapshots != "" {
+		action := blob.DeleteSnapshotsOptionType(o.fs.opt.DeleteSnapshots)
+		opt.DeleteSnapshots = &action
 	}
 	return o.fs.pacer.Call(func() (bool, error) {
 		_, err := blb.Delete(ctx, &opt)

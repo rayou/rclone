@@ -22,6 +22,8 @@ type Oser interface {
 	Remove(name string) error
 	Rename(oldName, newName string) error
 	Stat(path string) (os.FileInfo, error)
+	Symlink(oldname, newname string) error
+	Readlink(name string) (s string, err error)
 }
 
 // realOs is an implementation of Oser backed by the "os" package
@@ -46,6 +48,14 @@ func (f realOsFile) Release() error {
 // Node
 func (f realOsFile) Node() vfs.Node {
 	return nil
+}
+
+func (f realOsFile) Lock() error {
+	return os.ErrInvalid
+}
+
+func (f realOsFile) Unlock() error {
+	return os.ErrInvalid
 }
 
 // Chtimes
@@ -120,6 +130,16 @@ func (r realOs) Rename(oldName, newName string) error {
 // Stat
 func (r realOs) Stat(path string) (os.FileInfo, error) {
 	return os.Stat(path)
+}
+
+// Symlink
+func (r realOs) Symlink(oldname, newname string) error {
+	return os.Symlink(oldname, newname)
+}
+
+// Readlink
+func (r realOs) Readlink(name string) (s string, err error) {
+	return os.Readlink(name)
 }
 
 // Check interfaces

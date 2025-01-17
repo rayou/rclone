@@ -1,6 +1,6 @@
 // Upload large files for b2
 //
-// Docs - https://www.backblaze.com/b2/docs/large_files.html
+// Docs - https://www.backblaze.com/docs/cloud-storage-large-files
 
 package b2
 
@@ -91,7 +91,7 @@ type largeUpload struct {
 // newLargeUpload starts an upload of object o from in with metadata in src
 //
 // If newInfo is set then metadata from that will be used instead of reading it from src
-func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs.ObjectInfo, defaultChunkSize fs.SizeSuffix, doCopy bool, newInfo *api.File) (up *largeUpload, err error) {
+func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs.ObjectInfo, defaultChunkSize fs.SizeSuffix, doCopy bool, newInfo *api.File, options ...fs.OpenOption) (up *largeUpload, err error) {
 	size := src.Size()
 	parts := 0
 	chunkSize := defaultChunkSize
@@ -104,11 +104,6 @@ func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs
 			parts++
 		}
 	}
-
-	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/b2_start_large_file",
-	}
 	bucket, bucketPath := o.split()
 	bucketID, err := f.getBucketID(ctx, bucket)
 	if err != nil {
@@ -118,11 +113,26 @@ func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs
 		BucketID: bucketID,
 		Name:     f.opt.Enc.FromStandardPath(bucketPath),
 	}
+	optionsToSend := make([]fs.OpenOption, 0, len(options))
 	if newInfo == nil {
-		modTime := src.ModTime(ctx)
+		modTime, err := o.getModTime(ctx, src, options)
+		if err != nil {
+			return nil, err
+		}
+
 		request.ContentType = fs.MimeType(ctx, src)
 		request.Info = map[string]string{
 			timeKey: timeString(modTime),
+		}
+		// Custom upload headers - remove header prefix since they are sent in the body
+		for _, option := range options {
+			k, v := option.Header()
+			k = strings.ToLower(k)
+			if strings.HasPrefix(k, headerPrefix) {
+				request.Info[k[len(headerPrefix):]] = v
+			} else {
+				optionsToSend = append(optionsToSend, option)
+			}
 		}
 		// Set the SHA1 if known
 		if !o.fs.opt.DisableCheckSum || doCopy {
@@ -133,6 +143,11 @@ func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs
 	} else {
 		request.ContentType = newInfo.ContentType
 		request.Info = newInfo.Info
+	}
+	opts := rest.Opts{
+		Method:  "POST",
+		Path:    "/b2_start_large_file",
+		Options: optionsToSend,
 	}
 	var response api.StartLargeFileResponse
 	err = f.pacer.Call(func() (bool, error) {
@@ -169,24 +184,26 @@ func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs
 // This should be returned with returnUploadURL when finished
 func (up *largeUpload) getUploadURL(ctx context.Context) (upload *api.GetUploadPartURLResponse, err error) {
 	up.uploadMu.Lock()
-	defer up.uploadMu.Unlock()
-	if len(up.uploads) == 0 {
-		opts := rest.Opts{
-			Method: "POST",
-			Path:   "/b2_get_upload_part_url",
-		}
-		var request = api.GetUploadPartURLRequest{
-			ID: up.id,
-		}
-		err := up.f.pacer.Call(func() (bool, error) {
-			resp, err := up.f.srv.CallJSON(ctx, &opts, &request, &upload)
-			return up.f.shouldRetry(ctx, resp, err)
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to get upload URL: %w", err)
-		}
-	} else {
+	if len(up.uploads) > 0 {
 		upload, up.uploads = up.uploads[0], up.uploads[1:]
+		up.uploadMu.Unlock()
+		return upload, nil
+	}
+	up.uploadMu.Unlock()
+
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/b2_get_upload_part_url",
+	}
+	var request = api.GetUploadPartURLRequest{
+		ID: up.id,
+	}
+	err = up.f.pacer.Call(func() (bool, error) {
+		resp, err := up.f.srv.CallJSON(ctx, &opts, &request, &upload)
+		return up.f.shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get upload URL: %w", err)
 	}
 	return upload, nil
 }
@@ -391,10 +408,11 @@ func (up *largeUpload) Stream(ctx context.Context, initialUploadBlock *pool.RW) 
 		hasMoreParts = true
 	)
 	up.size = initialUploadBlock.Size()
+	up.parts = 0
 	for part := 0; hasMoreParts; part++ {
 		// Get a block of memory from the pool and token which limits concurrency.
 		var rw *pool.RW
-		if part == 1 {
+		if part == 0 {
 			rw = initialUploadBlock
 		} else {
 			rw = up.f.getRW(false)
@@ -409,12 +427,18 @@ func (up *largeUpload) Stream(ctx context.Context, initialUploadBlock *pool.RW) 
 
 		// Read the chunk
 		var n int64
-		if part == 1 {
+		if part == 0 {
 			n = rw.Size()
 		} else {
 			n, err = io.CopyN(rw, up.in, up.chunkSize)
 			if err == io.EOF {
-				fs.Debugf(up.o, "Read less than a full chunk, making this the last one.")
+				if n == 0 {
+					fs.Debugf(up.o, "Not sending empty chunk after EOF - ending.")
+					up.f.putRW(rw)
+					break
+				} else {
+					fs.Debugf(up.o, "Read less than a full chunk %d, making this the last one.", n)
+				}
 				hasMoreParts = false
 			} else if err != nil {
 				// other kinds of errors indicate failure
@@ -424,7 +448,7 @@ func (up *largeUpload) Stream(ctx context.Context, initialUploadBlock *pool.RW) 
 		}
 
 		// Keep stats up to date
-		up.parts = part
+		up.parts += 1
 		up.size += n
 		if part > maxParts {
 			up.f.putRW(rw)
@@ -454,7 +478,7 @@ func (up *largeUpload) Copy(ctx context.Context) (err error) {
 		remaining = up.size
 	)
 	g.SetLimit(up.f.opt.UploadConcurrency)
-	for part := 0; part <= up.parts; part++ {
+	for part := 0; part < up.parts; part++ {
 		// Fail fast, in case an errgroup managed function returns an error
 		// gCtx is cancelled. There is no point in copying all the other parts.
 		if gCtx.Err() != nil {

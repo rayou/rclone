@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	smb2 "github.com/hirochachacha/go-smb2"
+	smb2 "github.com/cloudsoda/go-smb2"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config/obscure"
@@ -31,16 +31,32 @@ func (f *Fs) dial(ctx context.Context, network, addr string) (*conn, error) {
 		}
 	}
 
-	d := &smb2.Dialer{
-		Initiator: &smb2.NTLMInitiator{
+	d := &smb2.Dialer{}
+	if f.opt.UseKerberos {
+		cl, err := getKerberosClient()
+		if err != nil {
+			return nil, err
+		}
+
+		spn := f.opt.SPN
+		if spn == "" {
+			spn = "cifs/" + f.opt.Host
+		}
+
+		d.Initiator = &smb2.Krb5Initiator{
+			Client:    cl,
+			TargetSPN: spn,
+		}
+	} else {
+		d.Initiator = &smb2.NTLMInitiator{
 			User:      f.opt.User,
 			Password:  pass,
 			Domain:    f.opt.Domain,
 			TargetSPN: f.opt.SPN,
-		},
+		}
 	}
 
-	session, err := d.DialContext(ctx, tconn)
+	session, err := d.DialConn(ctx, tconn, addr)
 	if err != nil {
 		return nil, err
 	}

@@ -1,5 +1,4 @@
 //go:build !plan9 && !solaris && !js
-// +build !plan9,!solaris,!js
 
 package oracleobjectstorage
 
@@ -401,7 +400,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		multipart = false
 	}
 	if multipart {
-		err = o.uploadMultipart(ctx, src, in)
+		err = o.uploadMultipart(ctx, src, in, options...)
 		if err != nil {
 			return err
 		}

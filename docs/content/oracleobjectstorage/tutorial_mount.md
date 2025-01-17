@@ -1,9 +1,8 @@
 ---
 title: "Oracle Object Storage Mount"
 description: "Oracle Object Storage mounting tutorial"
-slug: tutorial_mount
-url: /oracleobjectstorage/tutorial_mount/
 ---
+
 # {{< icon "fa fa-cloud" >}} Mount Buckets and Expose via NFS Tutorial 
 This runbook shows how to [mount](/commands/rclone_mount/) *Oracle Object Storage* buckets as local file system in
 OCI compute Instance using rclone tool. 
@@ -209,7 +208,7 @@ rclone mount \
                                         # its exact meaning will depend on the backend. For HTTP based backends it is an HTTP PUT/GET/POST/etc and its response
     --cache-dir /tmp/rclone/cache       # Directory rclone will use for caching.
     --dir-cache-time 5m \               # Time to cache directory entries for (default 5m0s)
-    --vfs-cache-mode writes \           # Cache mode off|minimal|writes|full (default off), writes gives the maximum compatiblity like a local disk
+    --vfs-cache-mode writes \           # Cache mode off|minimal|writes|full (default off), writes gives the maximum compatibility like a local disk
     --vfs-cache-max-age 20m \           # Max age of objects in the cache (default 1h0m0s)
     --vfs-cache-max-size 10G \          # Max total size of objects in the cache (default off)
     --vfs-cache-poll-interval 1m \      # Interval to poll the cache for stale objects (default 1m0s)
@@ -330,7 +329,7 @@ then auto-mounting.
 Content of /etc/rclone/scripts/rclone_nanny_script.sh
 ```shell
 
-#!/bin/bash
+#!/usr/bin/env bash
 erroneous_list=$(df 2>&1 | grep -i 'Transport endpoint is not connected' | awk '{print ""$2"" }' | tr -d \:)
 rclone_list=$(findmnt -t fuse.rclone -n 2>&1 | awk '{print ""$1"" }' | tr -d \:)
 IFS=$'\n'; set -f
@@ -372,7 +371,7 @@ Install NFS Utils
 sudo yum install -y nfs-utils
 ```
 
-Export the desired directory via NFS Server in the same machine where rclone has mounted to, ensure NFS serivce has
+Export the desired directory via NFS Server in the same machine where rclone has mounted to, ensure NFS service has
 desired permissions to read the directory. If it runs as root, then it will have permissions for sure, but if it runs
 as separate user then ensure that user has necessary desired privileges.
 ```shell

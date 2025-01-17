@@ -12,7 +12,7 @@ During the initial setup with `rclone config` you will specify the upstream
 remotes as a space separated list. The upstream remotes can either be a local
 paths or other remotes.
 
-The attributes `:ro`, `:nc` and `:nc` can be attached to the end of the remote
+The attributes `:ro`, `:nc` and `:writeback` can be attached to the end of the remote
 to tag the remote as **read only**, **no create** or **writeback**, e.g.
 `remote:directory/subdirectory:ro` or `remote:directory/subdirectory:nc`.
 
@@ -68,11 +68,11 @@ Cache time of usage and free space (in seconds). This option is only useful when
 Enter a signed integer. Press Enter for the default ("120").
 cache_time>
 Remote config
---------------------
-[remote]
-type = union
-upstreams = remote1:dir1 remote2:dir2 remote3:dir3
---------------------
+Configuration complete.
+Options:
+- type: union
+- upstreams: remote1:dir1 remote2:dir2 remote3:dir3
+Keep this "remote" remote?
 y) Yes this is OK
 e) Edit this remote
 d) Delete this remote
@@ -286,6 +286,17 @@ Properties:
 - Env Var:     RCLONE_UNION_MIN_FREE_SPACE
 - Type:        SizeSuffix
 - Default:     1Gi
+
+#### --union-description
+
+Description of the remote.
+
+Properties:
+
+- Config:      description
+- Env Var:     RCLONE_UNION_DESCRIPTION
+- Type:        string
+- Required:    false
 
 ### Metadata
 

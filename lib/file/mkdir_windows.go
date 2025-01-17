@@ -1,5 +1,4 @@
-//go:build windows
-// +build windows
+//go:build windows && !go1.22
 
 package file
 
@@ -43,7 +42,7 @@ func MkdirAll(path string, perm os.FileMode) error {
 			// In extended-length form without trailing slash ("\\?\C:"), os.Stat
 			// and os.Mkdir both fails. With trailing slash ("\\?\C:\") works,
 			// and regular paths with or without it ("C:" and "C:\") both works.
-			path = path + string(os.PathSeparator)
+			path += string(os.PathSeparator)
 		} else {
 			// See if there is a parent to be created first.
 			// Not when path refer to a drive's root directory, because we don't
@@ -53,7 +52,7 @@ func MkdirAll(path string, perm os.FileMode) error {
 				j--
 			}
 			if j > 1 {
-				if path[:j-1] != `\\?\UNC` {
+				if path[:j-1] != `\\?\UNC` && path[:j-1] != `\\?` {
 					// Create parent.
 					err = MkdirAll(path[:j-1], perm)
 					if err != nil {

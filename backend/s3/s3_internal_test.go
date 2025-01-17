@@ -5,14 +5,17 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/hash"
@@ -57,7 +60,17 @@ func (f *Fs) InternalTestMetadata(t *testing.T) {
 		// "tier" - read only
 		// "btime" - read only
 	}
-	obj := fstests.PutTestContentsMetadata(ctx, t, f, &item, contents, true, "text/html", metadata)
+	// Cloudflare insists on decompressing `Content-Encoding: gzip` unless
+	// `Cache-Control: no-transform` is supplied. This is a deviation from
+	// AWS but we fudge the tests here rather than breaking peoples
+	// expectations of what Cloudflare does.
+	//
+	// This can always be overridden by using
+	// `--header-upload "Cache-Control: no-transform"`
+	if f.opt.Provider == "Cloudflare" {
+		metadata["cache-control"] = "no-transform"
+	}
+	obj := fstests.PutTestContentsMetadata(ctx, t, f, &item, true, contents, true, "text/html", metadata)
 	defer func() {
 		assert.NoError(t, obj.Remove(ctx))
 	}()
@@ -130,20 +143,20 @@ func TestVersionLess(t *testing.T) {
 	t1 := fstest.Time("2022-01-21T12:00:00+01:00")
 	t2 := fstest.Time("2022-01-21T12:00:01+01:00")
 	for n, test := range []struct {
-		a, b *s3.ObjectVersion
+		a, b *types.ObjectVersion
 		want bool
 	}{
 		{a: nil, b: nil, want: true},
-		{a: &s3.ObjectVersion{Key: &key1, LastModified: &t1}, b: nil, want: false},
-		{a: nil, b: &s3.ObjectVersion{Key: &key1, LastModified: &t1}, want: true},
-		{a: &s3.ObjectVersion{Key: &key1, LastModified: &t1}, b: &s3.ObjectVersion{Key: &key1, LastModified: &t1}, want: false},
-		{a: &s3.ObjectVersion{Key: &key1, LastModified: &t1}, b: &s3.ObjectVersion{Key: &key1, LastModified: &t2}, want: false},
-		{a: &s3.ObjectVersion{Key: &key1, LastModified: &t2}, b: &s3.ObjectVersion{Key: &key1, LastModified: &t1}, want: true},
-		{a: &s3.ObjectVersion{Key: &key1, LastModified: &t1}, b: &s3.ObjectVersion{Key: &key2, LastModified: &t1}, want: true},
-		{a: &s3.ObjectVersion{Key: &key2, LastModified: &t1}, b: &s3.ObjectVersion{Key: &key1, LastModified: &t1}, want: false},
-		{a: &s3.ObjectVersion{Key: &key1, LastModified: &t1, IsLatest: aws.Bool(false)}, b: &s3.ObjectVersion{Key: &key1, LastModified: &t1}, want: false},
-		{a: &s3.ObjectVersion{Key: &key1, LastModified: &t1, IsLatest: aws.Bool(true)}, b: &s3.ObjectVersion{Key: &key1, LastModified: &t1}, want: true},
-		{a: &s3.ObjectVersion{Key: &key1, LastModified: &t1, IsLatest: aws.Bool(false)}, b: &s3.ObjectVersion{Key: &key1, LastModified: &t1, IsLatest: aws.Bool(true)}, want: false},
+		{a: &types.ObjectVersion{Key: &key1, LastModified: &t1}, b: nil, want: false},
+		{a: nil, b: &types.ObjectVersion{Key: &key1, LastModified: &t1}, want: true},
+		{a: &types.ObjectVersion{Key: &key1, LastModified: &t1}, b: &types.ObjectVersion{Key: &key1, LastModified: &t1}, want: false},
+		{a: &types.ObjectVersion{Key: &key1, LastModified: &t1}, b: &types.ObjectVersion{Key: &key1, LastModified: &t2}, want: false},
+		{a: &types.ObjectVersion{Key: &key1, LastModified: &t2}, b: &types.ObjectVersion{Key: &key1, LastModified: &t1}, want: true},
+		{a: &types.ObjectVersion{Key: &key1, LastModified: &t1}, b: &types.ObjectVersion{Key: &key2, LastModified: &t1}, want: true},
+		{a: &types.ObjectVersion{Key: &key2, LastModified: &t1}, b: &types.ObjectVersion{Key: &key1, LastModified: &t1}, want: false},
+		{a: &types.ObjectVersion{Key: &key1, LastModified: &t1, IsLatest: aws.Bool(false)}, b: &types.ObjectVersion{Key: &key1, LastModified: &t1}, want: false},
+		{a: &types.ObjectVersion{Key: &key1, LastModified: &t1, IsLatest: aws.Bool(true)}, b: &types.ObjectVersion{Key: &key1, LastModified: &t1}, want: true},
+		{a: &types.ObjectVersion{Key: &key1, LastModified: &t1, IsLatest: aws.Bool(false)}, b: &types.ObjectVersion{Key: &key1, LastModified: &t1, IsLatest: aws.Bool(true)}, want: false},
 	} {
 		got := versionLess(test.a, test.b)
 		assert.Equal(t, test.want, got, fmt.Sprintf("%d: %+v", n, test))
@@ -156,24 +169,24 @@ func TestMergeDeleteMarkers(t *testing.T) {
 	t1 := fstest.Time("2022-01-21T12:00:00+01:00")
 	t2 := fstest.Time("2022-01-21T12:00:01+01:00")
 	for n, test := range []struct {
-		versions []*s3.ObjectVersion
-		markers  []*s3.DeleteMarkerEntry
-		want     []*s3.ObjectVersion
+		versions []types.ObjectVersion
+		markers  []types.DeleteMarkerEntry
+		want     []types.ObjectVersion
 	}{
 		{
-			versions: []*s3.ObjectVersion{},
-			markers:  []*s3.DeleteMarkerEntry{},
-			want:     []*s3.ObjectVersion{},
+			versions: []types.ObjectVersion{},
+			markers:  []types.DeleteMarkerEntry{},
+			want:     []types.ObjectVersion{},
 		},
 		{
-			versions: []*s3.ObjectVersion{
+			versions: []types.ObjectVersion{
 				{
 					Key:          &key1,
 					LastModified: &t1,
 				},
 			},
-			markers: []*s3.DeleteMarkerEntry{},
-			want: []*s3.ObjectVersion{
+			markers: []types.DeleteMarkerEntry{},
+			want: []types.ObjectVersion{
 				{
 					Key:          &key1,
 					LastModified: &t1,
@@ -181,14 +194,14 @@ func TestMergeDeleteMarkers(t *testing.T) {
 			},
 		},
 		{
-			versions: []*s3.ObjectVersion{},
-			markers: []*s3.DeleteMarkerEntry{
+			versions: []types.ObjectVersion{},
+			markers: []types.DeleteMarkerEntry{
 				{
 					Key:          &key1,
 					LastModified: &t1,
 				},
 			},
-			want: []*s3.ObjectVersion{
+			want: []types.ObjectVersion{
 				{
 					Key:          &key1,
 					LastModified: &t1,
@@ -197,7 +210,7 @@ func TestMergeDeleteMarkers(t *testing.T) {
 			},
 		},
 		{
-			versions: []*s3.ObjectVersion{
+			versions: []types.ObjectVersion{
 				{
 					Key:          &key1,
 					LastModified: &t2,
@@ -207,13 +220,13 @@ func TestMergeDeleteMarkers(t *testing.T) {
 					LastModified: &t2,
 				},
 			},
-			markers: []*s3.DeleteMarkerEntry{
+			markers: []types.DeleteMarkerEntry{
 				{
 					Key:          &key1,
 					LastModified: &t1,
 				},
 			},
-			want: []*s3.ObjectVersion{
+			want: []types.ObjectVersion{
 				{
 					Key:          &key1,
 					LastModified: &t2,
@@ -390,6 +403,42 @@ func (f *Fs) InternalTestVersions(t *testing.T) {
 					}
 				})
 			})
+		}
+	})
+
+	t.Run("Mkdir", func(t *testing.T) {
+		// Test what happens when we create a bucket we already own and see whether the
+		// quirk is set correctly
+		req := s3.CreateBucketInput{
+			Bucket: &f.rootBucket,
+			ACL:    types.BucketCannedACL(f.opt.BucketACL),
+		}
+		if f.opt.LocationConstraint != "" {
+			req.CreateBucketConfiguration = &types.CreateBucketConfiguration{
+				LocationConstraint: types.BucketLocationConstraint(f.opt.LocationConstraint),
+			}
+		}
+		err := f.pacer.Call(func() (bool, error) {
+			_, err := f.c.CreateBucket(ctx, &req)
+			return f.shouldRetry(ctx, err)
+		})
+		var errString string
+		var awsError smithy.APIError
+		if err == nil {
+			errString = "No Error"
+		} else if errors.As(err, &awsError) {
+			errString = awsError.ErrorCode()
+		} else {
+			assert.Fail(t, "Unknown error %T %v", err, err)
+		}
+		t.Logf("Creating a bucket we already have created returned code: %s", errString)
+		switch errString {
+		case "BucketAlreadyExists":
+			assert.False(t, f.opt.UseAlreadyExists.Value, "Need to clear UseAlreadyExists quirk")
+		case "No Error", "BucketAlreadyOwnedByYou":
+			assert.True(t, f.opt.UseAlreadyExists.Value, "Need to set UseAlreadyExists quirk")
+		default:
+			assert.Fail(t, "Unknown error string %q", errString)
 		}
 	})
 
